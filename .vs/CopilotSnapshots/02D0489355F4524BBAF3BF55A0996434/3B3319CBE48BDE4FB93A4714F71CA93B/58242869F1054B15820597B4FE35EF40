@@ -1,0 +1,288 @@
+﻿import type { Game } from "../game";
+import type { Player } from "./player";
+import * as net from "../../../shared/net/net";
+import { v2, type Vec2 } from "../../../shared/utils/v2";
+import { math } from "../../../shared/utils/math";
+import { GameConfig } from "../../../shared/gameConfig";
+import { util } from "../../../shared/utils/util";
+import { BotSocket } from "./botSocket";
+import { randomUUID } from "node:crypto";
+
+enum BotState {
+    IDLE,
+    LOOTING,
+    ATTACKING,
+}
+
+export class Bot {
+    private player: Player;
+    private state: BotState = BotState.IDLE;
+    private targetLoot?: { pos: Vec2; dist: number };
+    private targetEnemy?: Player;
+    private moveDirection = v2.create(0, 0);
+    private aimDirection = v2.create(1, 0);
+    private lastStateChangeTime = 0;
+    private stateChangeInterval = 0; // Randomized per state
+
+    constructor(private game: Game, pos?: Vec2, name?: string) {
+        const botPos = pos ?? this.getRandomSpawnPosition();
+        const socketId = randomUUID();
+
+        // Create a dummy join message for the bot player
+        const joinMsg = new net.JoinMsg();
+        joinMsg.protocol = GameConfig.protocolVersion;
+        joinMsg.matchPriv = "";
+        joinMsg.questPriv = "";
+        joinMsg.name = name ?? `Bot_${Math.random().toString(16).slice(2, 8)}`;
+        joinMsg.useTouch = false;
+        joinMsg.isMobile = false;
+        joinMsg.bot = true;
+        joinMsg.loadout = GameConfig.player.defaultLoadout;
+
+        // Create player with dummy socket
+        this.player = new Player(
+            this.game,
+            botPos,
+            0,
+            joinMsg.name,
+            socketId,
+            joinMsg,
+            "127.0.0.1",
+            "127.0.0.1",
+            null,
+        );
+
+        // Register bot as a regular player
+        this.game.playerBarn.activatePlayer(this.player);
+
+        this.randomizeStateChangeInterval();
+    }
+
+    private getRandomSpawnPosition(): Vec2 {
+        const mapWidth = this.game.map.width;
+        const mapHeight = this.game.map.height;
+        const padding = 50;
+        return v2.create(
+            util.random(padding, mapWidth - padding),
+            util.random(padding, mapHeight - padding),
+        );
+    }
+
+    private randomizeStateChangeInterval(): void {
+        // Change state behavior every 3-8 seconds
+        this.stateChangeInterval = util.random(3, 8);
+        this.lastStateChangeTime = 0;
+    }
+
+    private findNearestLoot(range: number = 100): { pos: Vec2; dist: number } | undefined {
+        const loots = this.game.lootBarn.loots;
+        let nearest: { pos: Vec2; dist: number } | undefined;
+        let nearestDist = range;
+
+        for (const loot of loots) {
+            if (loot.destroyed) continue;
+            if (loot.layer !== this.player.layer) continue;
+
+            const dist = v2.distance(this.player.pos, loot.pos);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest = { pos: v2.copy(loot.pos), dist };
+            }
+        }
+
+        return nearest;
+    }
+
+    private findNearestEnemy(range: number = 150): Player | undefined {
+        const livingPlayers = this.game.playerBarn.livingPlayers;
+        let nearest: Player | undefined;
+        let nearestDist = range;
+
+        for (const player of livingPlayers) {
+            if (player === this.player) continue;
+            if (player.dead || player.downed) continue;
+            if (player.layer !== this.player.layer) continue;
+
+            const dist = v2.distance(this.player.pos, player.pos);
+            if (dist < nearestDist && dist > 0) {
+                nearestDist = dist;
+                nearest = player;
+            }
+        }
+
+        return nearest;
+    }
+
+    private findNearbyBuildings(range: number = 100): Vec2 | undefined {
+        const buildings = this.game.map.buildings;
+        for (const building of buildings) {
+            if (building.layer !== this.player.layer) continue;
+
+            const dist = v2.distance(this.player.pos, building.pos);
+            if (dist < range && dist > 0) {
+                return v2.copy(building.pos);
+            }
+        }
+        return undefined;
+    }
+
+    private updateState(): void {
+        this.lastStateChangeTime += 1 / this.game.modeManager.game.config.tps;
+
+        if (this.lastStateChangeTime >= this.stateChangeInterval) {
+            // Time to potentially change state
+            const nearestEnemy = this.findNearestEnemy(200);
+            const nearestLoot = this.findNearestLoot(150);
+
+            if (nearestEnemy) {
+                this.state = BotState.ATTACKING;
+                this.targetEnemy = nearestEnemy;
+            } else if (nearestLoot) {
+                this.state = BotState.LOOTING;
+                this.targetLoot = nearestLoot;
+            } else {
+                this.state = BotState.IDLE;
+                this.targetEnemy = undefined;
+                this.targetLoot = undefined;
+            }
+
+            this.randomizeStateChangeInterval();
+        }
+    }
+
+    private updateMovement(): void {
+        // Default: gentle wandering
+        v2.set(this.moveDirection, v2.create(0, 0));
+
+        switch (this.state) {
+            case BotState.IDLE: {
+                // Random wandering with pauses
+                if (Math.random() < 0.05) {
+                    // 5% chance to pick a new random direction each tick
+                    const randomDir = v2.randomUnit();
+                    v2.set(this.moveDirection, randomDir);
+                }
+                break;
+            }
+
+            case BotState.LOOTING: {
+                if (this.targetLoot) {
+                    const dirToLoot = v2.sub(this.targetLoot.pos, this.player.pos);
+                    const distToLoot = v2.length(dirToLoot);
+
+                    if (distToLoot > 2) {
+                        // Move toward loot
+                        v2.set(this.moveDirection, v2.normalizeSafe(dirToLoot, v2.create(1, 0)));
+                    } else {
+                        // Stop moving when close
+                        v2.set(this.moveDirection, v2.create(0, 0));
+                    }
+
+                    // Update aim to face the loot
+                    v2.set(this.aimDirection, v2.normalizeSafe(dirToLoot, this.aimDirection));
+                } else {
+                    this.state = BotState.IDLE;
+                }
+                break;
+            }
+
+            case BotState.ATTACKING: {
+                if (this.targetEnemy && !this.targetEnemy.dead) {
+                    const dirToEnemy = v2.sub(this.targetEnemy.pos, this.player.pos);
+                    const distToEnemy = v2.length(dirToEnemy);
+
+                    // Strafe around the enemy
+                    const perpDir = v2.create(-dirToEnemy.y, dirToEnemy.x);
+                    v2.set(
+                        this.moveDirection,
+                        v2.mul(v2.normalizeSafe(perpDir, v2.create(1, 0)), 0.7),
+                    );
+
+                    // Keep aiming at the enemy
+                    v2.set(
+                        this.aimDirection,
+                        v2.normalizeSafe(dirToEnemy, this.aimDirection),
+                    );
+                } else {
+                    this.state = BotState.IDLE;
+                }
+                break;
+            }
+        }
+    }
+
+    private updateActions(): void {
+        switch (this.state) {
+            case BotState.ATTACKING: {
+                if (this.targetEnemy && !this.targetEnemy.dead) {
+                    const dist = v2.distance(this.player.pos, this.targetEnemy.pos);
+                    // Shoot if enemy is within 200 units
+                    if (dist < 200) {
+                        this.player.shootStart = true;
+                        this.player.shootHold = true;
+                    }
+                }
+                break;
+            }
+
+            case BotState.LOOTING: {
+                // Try to pick up nearby loot
+                const closestLoot = this.player.getClosestLoot();
+                if (closestLoot) {
+                    this.player.pickupLoot(closestLoot);
+                }
+                break;
+            }
+
+            case BotState.IDLE: {
+                // Occasionally switch weapons or reload
+                if (Math.random() < 0.01) {
+                    if (this.player.activeWeapon !== "fists") {
+                        this.player.shootStart = false;
+                        this.player.shootHold = false;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    update(dt: number): void {
+        if (this.player.dead) {
+            // Bot is dead, do nothing
+            return;
+        }
+
+        this.updateState();
+        this.updateMovement();
+        this.updateActions();
+
+        // Create input message for this tick
+        const inputMsg = new net.InputMsg();
+
+        // Set movement inputs based on moveDirection
+        const moveThreshold = 0.1;
+        if (this.moveDirection.x > moveThreshold) {
+            inputMsg.moveRight = true;
+        } else if (this.moveDirection.x < -moveThreshold) {
+            inputMsg.moveLeft = true;
+        }
+
+        if (this.moveDirection.y > moveThreshold) {
+            inputMsg.moveUp = true;
+        } else if (this.moveDirection.y < -moveThreshold) {
+            inputMsg.moveDown = true;
+        }
+
+        // Set aim direction
+        inputMsg.toMouseDir = v2.copy(this.aimDirection);
+        inputMsg.toMouseLen = 50; // Default aiming distance
+
+        // Apply input to the bot's player
+        this.player.handleInput(inputMsg);
+    }
+
+    getPlayer(): Player {
+        return this.player;
+    }
+}
